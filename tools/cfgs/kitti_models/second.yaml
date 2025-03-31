@@ -11,7 +11,7 @@ MODEL:
         NAME: MeanVFE
 
     BACKBONE_3D:
-        NAME: VoxelBackBone8x
+        NAME: VoxelResBackBone8xLargeKernel3D
 
     MAP_TO_BEV:
         NAME: HeightCompression

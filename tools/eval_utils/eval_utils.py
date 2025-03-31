@@ -122,10 +122,13 @@ def eval_one_epoch(cfg, args, model, dataloader, epoch_id, logger, dist_test=Fal
     with open(result_dir / 'result.pkl', 'wb') as f:
         pickle.dump(det_annos, f)
 
+    sparse_eval = getattr(args, 'sparse_eval', False)
+
     result_str, result_dict = dataset.evaluation(
         det_annos, class_names,
         eval_metric=cfg.MODEL.POST_PROCESSING.EVAL_METRIC,
-        output_path=final_output_dir
+        output_path=final_output_dir,
+        sparse_eval = sparse_eval
     )
 
     logger.info(result_str)

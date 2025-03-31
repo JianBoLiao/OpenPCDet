@@ -41,6 +41,8 @@ def parse_config():
     parser.add_argument('--save_to_file', action='store_true', default=False, help='')
     parser.add_argument('--infer_time', action='store_true', default=False, help='calculate inference latency')
 
+    parser.add_argument('--sparse_eval', action='store_true', default=False, help='whether eval sparse target')
+
     args = parser.parse_args()
 
     cfg_from_yaml_file(args.cfg_file, cfg)
@@ -159,6 +161,8 @@ def main():
         assert args.batch_size % total_gpus == 0, 'Batch size should match the number of gpus'
         args.batch_size = args.batch_size // total_gpus
 
+    extra_tag = 'sparse' if args.sparse_eval else 'default'
+
     output_dir = cfg.ROOT_DIR / 'output' / cfg.EXP_GROUP_PATH / cfg.TAG / args.extra_tag
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -172,7 +176,7 @@ def main():
         eval_output_dir = eval_output_dir / 'eval_all_default'
 
     if args.eval_tag is not None:
-        eval_output_dir = eval_output_dir / args.eval_tag
+        eval_output_dir = eval_output_dir / extra_tag
 
     eval_output_dir.mkdir(parents=True, exist_ok=True)
     log_file = eval_output_dir / ('log_eval_%s.txt' % datetime.datetime.now().strftime('%Y%m%d-%H%M%S'))

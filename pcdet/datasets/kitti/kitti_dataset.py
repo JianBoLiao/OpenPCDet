@@ -147,6 +147,44 @@ class KittiDataset(DatasetTemplate):
 
         return pts_valid_flag
 
+    @staticmethod
+    def get_distribution(points, box, num_divided):
+        '''计算点云在框内的分布均匀度
+
+        Args:
+            points (num_pts, 3): point cloud
+            corners (7, ): box [x, y, z, dx, dy, dz, heading], (x, y, z) is the box center
+            num_divided (int): 把框均分的比例
+        '''
+        x0 = box[0] - box[3] * (num_divided - 1) / (2 * num_divided)
+        y0 = box[1] - box[4] * (num_divided - 1) / (2 * num_divided)
+        z0 = box[2] - box[5] * (num_divided - 1) / (2 * num_divided)
+        box_size = np.array([box[3], box[4], box[5]]) / num_divided
+        box_head = box[6]
+        center0 = np.array([x0, y0, z0])
+        nums_no_empty_boxes = 0
+
+        centers = center0 + np.array(np.meshgrid(
+            np.arange(num_divided),
+            np.arange(num_divided),
+            np.arange(num_divided)
+        )).T.reshape(-1, 3) * box_size
+
+        boxes = np.concatenate([centers,
+                                np.tile(box_size, (centers.shape[0], 1)),
+                                np.full((centers.shape[0], 1), box_head)
+                                ], axis=1
+        )
+
+        boxes_corners = box_utils.boxes_to_corners_3d(boxes)
+        for box_corners in boxes_corners:
+            flags = box_utils.in_hull(points, box_corners)
+            if np.any(flags):
+                nums_no_empty_boxes += 1
+        
+        nums_total_boxes = num_divided * num_divided * num_divided
+        return (nums_no_empty_boxes / nums_total_boxes)
+    
     def get_infos(self, num_workers=4, has_label=True, count_inside_pts=True, sample_id_list=None):
         import concurrent.futures as futures
 
@@ -197,22 +235,32 @@ class KittiDataset(DatasetTemplate):
                 gt_boxes_lidar = np.concatenate([loc_lidar, l, w, h, -(np.pi / 2 + rots[..., np.newaxis])], axis=1)
                 annotations['gt_boxes_lidar'] = gt_boxes_lidar
 
-                info['annos'] = annotations
-
                 if count_inside_pts:
                     points = self.get_lidar(sample_idx)
                     calib = self.get_calib(sample_idx)
                     pts_rect = calib.lidar_to_rect(points[:, 0:3])
-
+                    # 只保留在相机视野里面的点
                     fov_flag = self.get_fov_flag(pts_rect, info['image']['image_shape'], calib)
                     pts_fov = points[fov_flag]
                     corners_lidar = box_utils.boxes_to_corners_3d(gt_boxes_lidar)
                     num_points_in_gt = -np.ones(num_gt, dtype=np.int32)
+                    density_points_in_gt = -np.ones(num_gt, dtype=np.float32)
+                    distribution_points_in_gt = -np.ones(num_gt, dtype=np.float32)
 
                     for k in range(num_objects):
                         flag = box_utils.in_hull(pts_fov[:, 0:3], corners_lidar[k])
                         num_points_in_gt[k] = flag.sum()
+                        l = gt_boxes_lidar[k][3]
+                        h = gt_boxes_lidar[k][4]
+                        w = gt_boxes_lidar[k][5]
+                        density_points_in_gt[k] = flag.sum() / (l * h + l * w + w * h) / 2
+                        distribution_points_in_gt[k] = self.get_distribution(pts_fov[flag, 0:3], gt_boxes_lidar[k], 5)
+
                     annotations['num_points_in_gt'] = num_points_in_gt
+                    annotations['density_points_in_gt'] = density_points_in_gt
+                    annotations['distribution_points_in_gt'] = distribution_points_in_gt
+
+                info['annos'] = annotations
 
             return info
 
@@ -220,6 +268,63 @@ class KittiDataset(DatasetTemplate):
         with futures.ThreadPoolExecutor(num_workers) as executor:
             infos = executor.map(process_single_scene, sample_id_list)
         return list(infos)
+    
+    def create_groundtruth_database_sparse(self, info_path=None, used_classes=None, split='train'):
+        import torch
+        import os
+
+        database_save_path = Path(self.root_path) / ('gt_database_sparse' if split == 'train' else ('gt_database_%s' % split))
+        sparse_dir = ['0', '1', '2']
+        MIN_DENSITY = [10, 5, 0]
+        MIN_DIRSTRIBUTION = [0.2, 0.1, 0]
+        database_save_path.mkdir(parents=True, exist_ok=True)
+        for dir in sparse_dir:
+            if not os.path.exists(database_save_path / dir):
+                os.makedirs(database_save_path / dir)
+
+        with open(info_path, 'rb') as f:
+            infos = pickle.load(f)
+
+        for k in range(len(infos)):
+            print('gt_database sample: %d/%d' % (k + 1, len(infos)))
+            info = infos[k]
+            sample_idx = info['point_cloud']['lidar_idx']
+            points = self.get_lidar(sample_idx)
+            annos = info['annos']
+            names = annos['name']
+            difficulty = annos['difficulty']
+            bbox = annos['bbox']
+            gt_boxes = annos['gt_boxes_lidar']
+            density = annos['density_points_in_gt']
+            distribution = annos['distribution_points_in_gt']
+
+            num_obj = gt_boxes.shape[0]
+            point_indices = roiaware_pool3d_utils.points_in_boxes_cpu(
+                torch.from_numpy(points[:, 0:3]), torch.from_numpy(gt_boxes)
+            ).numpy()  # (nboxes, npoints)
+
+            for i in range(num_obj):
+                filename = '%s_%s_%d.bin' % (sample_idx, names[i], i)
+                gt_info_filename = '%s_%s_%d.npy' % (sample_idx, names[i], i)
+                if (density[i] > MIN_DENSITY[0] and distribution[i] > MIN_DIRSTRIBUTION[0]):
+                    file_dir = database_save_path / sparse_dir[0]
+                elif (density[i] > MIN_DENSITY[1] and distribution[i] > MIN_DIRSTRIBUTION[1]):
+                    file_dir = database_save_path / sparse_dir[1]
+                elif (density[i] > MIN_DENSITY[2] and distribution[i] > MIN_DIRSTRIBUTION[2]):
+                    file_dir = database_save_path / sparse_dir[2]
+                else:
+                    continue
+
+                ptsfilepath = file_dir / filename
+                gtfilepath = file_dir / gt_info_filename
+                gt_points = points[point_indices[i] > 0]
+
+                gt_points[:, :3] -= gt_boxes[i, :3]
+                gt_boxes[i, :3] = [0, 0 ,0]
+                with open(ptsfilepath, 'w') as f:
+                    gt_points.tofile(f)
+            
+                np.save(gtfilepath, gt_boxes[i])
 
     def create_groundtruth_database(self, info_path=None, used_classes=None, split='train'):
         import torch
@@ -353,8 +458,13 @@ class KittiDataset(DatasetTemplate):
     def evaluation(self, det_annos, class_names, **kwargs):
         if 'annos' not in self.kitti_infos[0].keys():
             return None, {}
-
-        from .kitti_object_eval_python import eval as kitti_eval
+        sparse_eval = False
+        if 'sparse_eval' in kwargs:
+            sparse_eval = kwargs['sparse_eval']
+        if sparse_eval :
+            from .kitti_object_eval_python import eval_sparse as kitti_eval
+        else:
+            from .kitti_object_eval_python import eval as kitti_eval
 
         eval_det_annos = copy.deepcopy(det_annos)
         eval_gt_annos = [copy.deepcopy(info['annos']) for info in self.kitti_infos]
@@ -427,6 +537,51 @@ class KittiDataset(DatasetTemplate):
         data_dict['image_shape'] = img_shape
         return data_dict
 
+def create_kitti_infos_sparse(dataset_cfg, class_names, data_path, save_path, workers=4):
+    dataset = KittiDataset(dataset_cfg=dataset_cfg, class_names=class_names, root_path=data_path, training=False)
+    train_split, val_split, demo_split = 'train', 'val', 'zero_points_scenes'
+
+    train_filename = save_path / ('kitti_infos_%s_1.pkl' % train_split)
+    val_filename = save_path / ('kitti_infos_%s_1.pkl' % val_split)
+    demo_filename = save_path / ('kitti_infos_%s_1.pkl' % demo_split)
+    trainval_filename = save_path / 'kitti_infos_trainval_1.pkl'
+    test_filename = save_path / 'kitti_infos_test_1.pkl'
+
+    print('---------------Start to generate data infos---------------')
+
+    dataset.set_split(train_split)
+    kitti_infos_train = dataset.get_infos(num_workers=workers, has_label=True, count_inside_pts=True)
+    with open(train_filename, 'wb') as f:
+        pickle.dump(kitti_infos_train, f)
+    print('Kitti info train file is saved to %s' % train_filename)
+
+    dataset.set_split(val_split)
+    kitti_infos_val = dataset.get_infos(num_workers=workers, has_label=True, count_inside_pts=True)
+    with open(val_filename, 'wb') as f:
+        pickle.dump(kitti_infos_val, f)
+    print('Kitti info val file is saved to %s' % val_filename)
+
+    dataset.set_split(demo_split)
+    kitti_infos_val = dataset.get_infos(num_workers=workers, has_label=True, count_inside_pts=True)
+    with open(demo_filename, 'wb') as f:
+        pickle.dump(kitti_infos_val, f)
+    print('Kitti info val file is saved to %s' % demo_filename)
+
+    with open(trainval_filename, 'wb') as f:
+        pickle.dump(kitti_infos_train + kitti_infos_val, f)
+    print('Kitti info trainval file is saved to %s' % trainval_filename)
+
+    dataset.set_split('test')
+    kitti_infos_test = dataset.get_infos(num_workers=workers, has_label=False, count_inside_pts=False)
+    with open(test_filename, 'wb') as f:
+        pickle.dump(kitti_infos_test, f)
+    print('Kitti info test file is saved to %s' % test_filename)
+
+    print('---------------Start create groundtruth database for data augmentation---------------')
+    dataset.set_split(train_split)
+    dataset.create_groundtruth_database_sparse(train_filename, split=train_split)
+
+    print('---------------Data preparation Done---------------')
 
 def create_kitti_infos(dataset_cfg, class_names, data_path, save_path, workers=4):
     dataset = KittiDataset(dataset_cfg=dataset_cfg, class_names=class_names, root_path=data_path, training=False)
