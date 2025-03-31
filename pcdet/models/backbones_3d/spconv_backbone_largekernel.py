@@ -74,12 +74,21 @@ class SpatialGroupConv(spconv.SparseModule):
                     self._indice_list.append(b.long())
 
     def _convert_weight(self, weight):
-        weight_reshape = self.block.weight.permute(3, 4, 0, 1, 2).reshape(self.out_channels, self.in_channels, -1).clone()
-        weight_return = self.block.weight.permute(3, 4, 0, 1, 2).reshape(self.out_channels, self.in_channels, -1).clone()
+        # weight_reshape = self.block.weight.permute(3, 4, 0, 1, 2).reshape(self.out_channels, self.in_channels, -1).clone()
+        # weight_return = self.block.weight.permute(3, 4, 0, 1, 2).reshape(self.out_channels, self.in_channels, -1).clone()
+        # for _indice in self._indice_list:
+        #     _mean_weight = torch.mean(weight_reshape[:, :, _indice], dim=-1, keepdim=True)
+        #     weight_return[:, :, _indice] = _mean_weight
+        # return weight_return.reshape(self.out_channels, self.in_channels, self.kernel_size, self.kernel_size, self.kernel_size).permute(2, 3, 4, 0, 1).contiguous()
+        weight_reshape = self.block.weight.permute(0, 4, 1, 2, 3).reshape(self.out_channels, self.in_channels,
+                                                                          -1).clone()
+        weight_return = self.block.weight.permute(0, 4, 1, 2, 3).reshape(self.out_channels, self.in_channels,
+                                                                         -1).clone()
         for _indice in self._indice_list:
             _mean_weight = torch.mean(weight_reshape[:, :, _indice], dim=-1, keepdim=True)
             weight_return[:, :, _indice] = _mean_weight
-        return weight_return.reshape(self.out_channels, self.in_channels, self.kernel_size, self.kernel_size, self.kernel_size).permute(2, 3, 4, 0, 1)
+        return weight_return.reshape(self.out_channels, self.in_channels, self.kernel_size, self.kernel_size,
+                                     self.kernel_size).permute(0, 2, 3, 4, 1).contiguous()
 
     def forward(self, x_conv):
         if self.training:
